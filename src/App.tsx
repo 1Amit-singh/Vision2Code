@@ -1,41 +1,30 @@
-import React, { useState, useRef, useEffect } from "react";
-import { 
-  Upload, 
-  Code, 
-  Eye, 
-  Send, 
-  Settings, 
-  Key, 
-  Image as ImageIcon, 
-  Loader2, 
-  Copy, 
-  Check,
-  RefreshCw,
-  Layout,
-  Terminal,
-  FileCode,
-  ChevronRight,
-  Plus,
-  Trash2,
-  FileJson,
-  MousePointer2,
-  X
-} from "lucide-react";
-import { motion, AnimatePresence } from "motion/react";
-import ReactMarkdown from "react-markdown";
-import Prism from "prismjs";
-import "prismjs/themes/prism-tomorrow.css";
-import "prismjs/components/prism-javascript";
-import "prismjs/components/prism-typescript";
-import "prismjs/components/prism-jsx";
-import "prismjs/components/prism-tsx";
-import "prismjs/components/prism-css";
-import "prismjs/components/prism-markup";
-
+import React, { useState, useRef, useEffect, useCallback } from "react";
+import { Header } from "./components/Header";
+import { Sidebar } from "./components/Sidebar";
+import { Editor } from "./components/Editor";
+import { ProjectListModal } from "./components/ProjectListModal";
+import { SettingsModal } from "./components/SettingsModal";
+import { LoadingOverlay } from "./components/LoadingOverlay";
+import { Project, ActiveTab, PreviewMode } from "./types";
 import { generateWebsiteCode, GeneratedFile } from "./services/geminiService";
-import { cn } from "./lib/utils";
+import ReactMarkdown from "react-markdown";
+import { motion } from "motion/react";
 
 export default function App() {
+  // Project State
+  const [projects, setProjects] = useState<Project[]>(() => {
+    try {
+      const saved = localStorage.getItem("v2c_projects");
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      console.error("Failed to load projects from localStorage:", e);
+      return [];
+    }
+  });
+  const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
+  const [showProjectList, setShowProjectList] = useState(false);
+
+  // UI State
   const [prompt, setPrompt] = useState("");
   const [image, setImage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -43,22 +32,141 @@ export default function App() {
   const [modifiedFileNames, setModifiedFileNames] = useState<Set<string>>(new Set());
   const [currentFileIndex, setCurrentFileIndex] = useState(0);
   const [explanation, setExplanation] = useState("");
-  const [activeTab, setActiveTab] = useState<"code" | "preview">("code");
+  const [activeTab, setActiveTab] = useState<ActiveTab>("code");
   const [isEditMode, setIsEditMode] = useState(false);
   const [selectedElement, setSelectedElement] = useState<{ html: string; tag: string; selector: string } | null>(null);
+  const [previewMode, setPreviewMode] = useState<PreviewMode>("desktop");
+  
+  // Settings State
   const [customApiKey, setCustomApiKey] = useState("");
   const [useCustomKey, setUseCustomKey] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [selectedModel, setSelectedModel] = useState("gemini-flash-latest");
   const [copied, setCopied] = useState(false);
 
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const previewRef = useRef<HTMLIFrameElement>(null);
 
+  // Persistence
   useEffect(() => {
-    Prism.highlightAll();
-  }, [files, currentFileIndex, activeTab]);
+    const saveToLocalStorage = (data: Project[]) => {
+      try {
+        localStorage.setItem("v2c_projects", JSON.stringify(data));
+      } catch (e: any) {
+        // Check if it's a quota exceeded error
+        if (
+          e.name === 'QuotaExceededError' || 
+          e.name === 'NS_ERROR_DOM_QUOTA_REACHED' || 
+          e.code === 22 || 
+          e.number === -2147024882
+        ) {
+          console.warn("LocalStorage quota exceeded, attempting to prune oldest project...");
+          if (data.length > 1) {
+            // Sort by updatedAt to find the oldest
+            const sorted = [...data].sort((a, b) => a.updatedAt - b.updatedAt);
+            
+            // Try to prune the oldest project that isn't the current one
+            let projectToPrune = sorted[0];
+            if (projectToPrune.id === currentProjectId && sorted.length > 1) {
+              projectToPrune = sorted[1];
+            }
+            
+            const pruned = data.filter(p => p.id !== projectToPrune.id);
+            setProjects(pruned);
+          } else {
+            console.error("LocalStorage quota exceeded and only one project remains. Project may be too large to save.");
+          }
+        } else {
+          console.error("Failed to save projects to localStorage:", e);
+        }
+      }
+    };
+    saveToLocalStorage(projects);
+  }, [projects, currentProjectId]);
 
+  useEffect(() => {
+    try {
+      if (currentProjectId) {
+        localStorage.setItem("v2c_last_project_id", currentProjectId);
+      } else {
+        localStorage.removeItem("v2c_last_project_id");
+      }
+    } catch (e) {
+      console.error("Failed to save last project ID to localStorage:", e);
+    }
+  }, [currentProjectId]);
+
+  useEffect(() => {
+    const lastProjectId = localStorage.getItem("v2c_last_project_id");
+    if (lastProjectId) {
+      const project = projects.find(p => p.id === lastProjectId);
+      if (project) {
+        loadProject(project);
+      }
+    }
+  }, []);
+
+  // Project Management
+  const saveProject = (name?: string) => {
+    if (files.length === 0 && !image && !prompt && name === undefined) return;
+
+    const id = currentProjectId || Math.random().toString(36).substring(7);
+    const projectName = name !== undefined ? name : (projects.find(p => p.id === id)?.name || `Project ${projects.length + 1}`);
+    
+    const newProject: Project = {
+      id,
+      name: projectName,
+      files,
+      image,
+      prompt,
+      explanation,
+      createdAt: projects.find(p => p.id === id)?.createdAt || Date.now(),
+      updatedAt: Date.now()
+    };
+
+    setProjects(prev => {
+      const index = prev.findIndex(p => p.id === id);
+      if (index !== -1) {
+        const updated = [...prev];
+        updated[index] = newProject;
+        return updated;
+      }
+      return [newProject, ...prev];
+    });
+    if (!currentProjectId) setCurrentProjectId(id);
+  };
+
+  const loadProject = (project: Project) => {
+    setCurrentProjectId(project.id);
+    setFiles(project.files);
+    setImage(project.image);
+    setPrompt(project.prompt);
+    setExplanation(project.explanation);
+    setModifiedFileNames(new Set());
+    setCurrentFileIndex(0);
+    setActiveTab("code");
+    setShowProjectList(false);
+  };
+
+  const deleteProject = (id: string) => {
+    setProjects(prev => prev.filter(p => p.id !== id));
+    if (currentProjectId === id) {
+      createNewProject();
+    }
+  };
+
+  const createNewProject = () => {
+    setCurrentProjectId(null);
+    setFiles([]);
+    setImage(null);
+    setPrompt("");
+    setExplanation("");
+    setModifiedFileNames(new Set());
+    setCurrentFileIndex(0);
+    setActiveTab("code");
+    setShowProjectList(false);
+  };
+
+  // Visual Edit Message Listener
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
       if (event.data?.type === "ELEMENT_SELECTED") {
@@ -69,12 +177,41 @@ export default function App() {
     return () => window.removeEventListener("message", handleMessage);
   }, []);
 
+  // Image Handling
+  const compressImage = (base64: string, maxWidth = 1200, quality = 0.7): Promise<string> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return resolve(base64);
+
+        let width = img.width;
+        let height = img.height;
+
+        if (width > maxWidth) {
+          height = Math.round((height * maxWidth) / width);
+          width = maxWidth;
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = () => resolve(base64);
+      img.src = base64;
+    });
+  };
+
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
-      reader.onloadend = () => {
-        setImage(reader.result as string);
+      reader.onloadend = async () => {
+        const base64 = reader.result as string;
+        const compressed = await compressImage(base64);
+        setImage(compressed);
       };
       reader.readAsDataURL(file);
     }
@@ -89,7 +226,7 @@ export default function App() {
         if (!ctx) return resolve([base64]);
 
         const segments: string[] = [];
-        const segmentHeight = 1000; // Max height per segment
+        const segmentHeight = 1000;
         const totalHeight = img.height;
         const width = img.width;
 
@@ -106,10 +243,15 @@ export default function App() {
         }
         resolve(segments);
       };
+      img.onerror = () => {
+        console.error("Image load error in cropImage");
+        resolve([base64]);
+      };
       img.src = base64;
     });
   };
 
+  // Generation Logic
   const handleGenerate = async () => {
     if (!prompt && !image) return;
     
@@ -149,11 +291,10 @@ If you need to update multiple files to reflect this change, do so.
         imageSegments,
         apiKey,
         selectedModel,
-        files // Send existing files for context
+        files
       );
       
       if (result.files.length > 0) {
-        // Merge or replace files
         const newFiles = [...files];
         const modified = new Set<string>();
         
@@ -173,7 +314,6 @@ If you need to update multiple files to reflect this change, do so.
         setSelectedElement(null);
         setIsEditMode(false);
         
-        // Switch to the first modified file if it exists
         if (result.files.length > 0) {
           const firstModifiedIndex = newFiles.findIndex(f => f.name === result.files[0].name);
           if (firstModifiedIndex !== -1) {
@@ -182,28 +322,52 @@ If you need to update multiple files to reflect this change, do so.
         }
         
         setActiveTab("code");
+        setTimeout(() => {
+          try {
+            saveProject();
+          } catch (e) {
+            console.error("Auto-save error:", e);
+          }
+        }, 100);
       }
     } catch (error: any) {
       console.error(error);
-      setExplanation(`Error: ${error.message || "An unknown error occurred."}`);
+      alert(error.message || "An error occurred during generation.");
     } finally {
       setLoading(false);
     }
   };
 
-  const copyToClipboard = () => {
-    if (files[currentFileIndex]) {
-      navigator.clipboard.writeText(files[currentFileIndex].content);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }
+  // Real-time Editing
+  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+    };
+  }, []);
+
+  const handleFileChange = (content: string) => {
+    const newFiles = [...files];
+    newFiles[currentFileIndex] = { ...newFiles[currentFileIndex], content };
+    setFiles(newFiles);
+    
+    // Debounce saveProject
+    if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+    saveTimeoutRef.current = setTimeout(() => {
+      try {
+        saveProject();
+      } catch (e) {
+        console.error("Debounced save error:", e);
+      }
+    }, 1000);
   };
 
-  const updatePreview = () => {
+  // Preview Logic
+  const updatePreview = useCallback(() => {
     if (previewRef.current && files.length > 0) {
       const doc = previewRef.current.contentDocument;
       if (doc) {
-        // Check if it's a React project
         const isReact = files.some(f => f.name.endsWith('.jsx') || f.name.endsWith('.tsx'));
         
         const selectionScript = isEditMode ? `
@@ -236,437 +400,270 @@ If you need to update multiple files to reflect this change, do so.
 
         doc.open();
         if (isReact) {
-          // React Preview using Babel Standalone
           const appFile = files.find(f => f.name.toLowerCase().includes('app')) || files[0];
           const otherFiles = files.filter(f => f !== appFile);
           
-          doc.write(`
-            <!DOCTYPE html>
-            <html>
-              <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <script src="https://cdn.tailwindcss.com"></script>
-                <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-                <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-                <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-                <script src="https://unpkg.com/lucide-react@0.344.0/dist/umd/lucide-react.min.js"></script>
-                <style>
-                  body { margin: 0; font-family: sans-serif; }
-                  ${isEditMode ? "* { transition: outline 0.1s ease; }" : ""}
-                </style>
-              </head>
-              <body>
-                <div id="root"></div>
-                <script type="text/babel">
-                  const { useState, useEffect, useRef, useMemo } = React;
-                  
-                  // Mock Lucide icons for preview
-                  const Lucide = window.LucideReact || {};
-                  
-                  ${otherFiles.map(f => {
-                    // Strip imports/exports for Babel standalone
-                    const content = f.content
-                      .replace(/import.*from.*;/g, '')
-                      .replace(/export default/g, `const ${f.name.split('.')[0]} =`)
-                      .replace(/export/g, '');
-                    return `// File: ${f.name}\n${content}`;
-                  }).join("\n\n")}
+          const otherFilesContent = otherFiles.map(f => {
+            const content = f.content
+              .replace(/import.*from.*;/g, '')
+              .replace(/export default/g, "const " + f.name.split('.')[0] + " =")
+              .replace(/export/g, '');
+            return "// File: " + f.name + "\n" + content;
+          }).join("\n\n");
 
-                  ${appFile.content
-                    .replace(/import.*from.*;/g, '')
-                    .replace(/export default/g, 'const App =')
-                    .replace(/export/g, '')}
+          const appFileContent = appFile.content
+            .replace(/import.*from.*;/g, '')
+            .replace(/export default/g, 'const App =')
+            .replace(/export/g, '');
 
-                  const root = ReactDOM.createRoot(document.getElementById('root'));
-                  root.render(<App />);
-                </script>
-                ${selectionScript}
-              </body>
-            </html>
-          `);
+          const html = [
+            '<!DOCTYPE html>',
+            '<html>',
+            '<head>',
+            '<meta charset="UTF-8">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+            '<script src="https://cdn.tailwindcss.com"></script>',
+            '<script src="https://unpkg.com/react@18/umd/react.development.js"></script>',
+            '<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>',
+            '<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>',
+            '<script src="https://unpkg.com/lucide-react@0.344.0/dist/umd/lucide-react.min.js"></script>',
+            '<style>',
+            'body { margin: 0; font-family: sans-serif; }',
+            isEditMode ? "* { transition: outline 0.1s ease; }" : "",
+            '</style>',
+            '</head>',
+            '<body>',
+            '<div id="root"></div>',
+            '<script id="preview-script" type="text/babel">',
+            'const React = window.React;',
+            'const ReactDOM = window.ReactDOM;',
+            'const { useState, useEffect, useRef, useMemo, useCallback } = React;',
+            'const Lucide = window.lucide || window.LucideReact || {};',
+            '// Helper to safely use Lucide icons',
+            'const Icon = ({ name, ...props }) => {',
+            '  const IconComponent = Lucide[name] || Lucide[name.charAt(0).toUpperCase() + name.slice(1)];',
+            '  return IconComponent ? React.createElement(IconComponent, props) : null;',
+            '};',
+            otherFilesContent,
+            appFileContent,
+            'try {',
+            '  const root = ReactDOM.createRoot(document.getElementById("root"));',
+            '  root.render(<App />);',
+            '} catch (err) {',
+            '  console.error("Render Error:", err);',
+            '  document.getElementById("root").innerHTML = `<div style="padding: 20px; color: red;">Render Error: ${err.message}</div>`;',
+            '}',
+            '</script>',
+            selectionScript,
+            '</body>',
+            '</html>'
+          ].join('\n');
+          doc.write(html);
         } else {
-          // Standard HTML/CSS/JS Preview
           const htmlFile = files.find(f => f.name.endsWith('.html')) || { content: '<div class="p-8">No HTML file found.</div>' };
           const cssFile = files.find(f => f.name.endsWith('.css')) || { content: '' };
           const jsFile = files.find(f => f.name.endsWith('.js')) || { content: '' };
 
-          doc.write(`
-            <!DOCTYPE html>
-            <html>
-              <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <script src="https://cdn.tailwindcss.com"></script>
-                <style>${cssFile.content}</style>
-              </head>
-              <body>
-                ${htmlFile.content}
-                <script>${jsFile.content}</script>
-                ${selectionScript}
-              </body>
-            </html>
-          `);
+          const html = [
+            '<!DOCTYPE html>',
+            '<html>',
+            '<head>',
+            '<meta charset="UTF-8">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+            '<script src="https://cdn.tailwindcss.com"></script>',
+            '<style>' + cssFile.content + '</style>',
+            '</head>',
+            '<body>',
+            htmlFile.content,
+            '<script>' + jsFile.content + '</script>',
+            selectionScript,
+            '</body>',
+            '</html>'
+          ].join('\n');
+          doc.write(html);
         }
         doc.close();
       }
     }
-  };
+  }, [files, isEditMode]);
 
   useEffect(() => {
     if (activeTab === "preview") {
       updatePreview();
     }
-  }, [activeTab, files, isEditMode]);
+  }, [activeTab, updatePreview]);
+
+  const handleFullScreen = () => {
+    const isReact = files.some(f => f.name.endsWith('.jsx') || f.name.endsWith('.tsx'));
+    const win = window.open("", "_blank");
+    if (!win) return;
+
+    if (isReact) {
+      const appFile = files.find(f => f.name.toLowerCase().includes('app')) || files[0];
+      const otherFiles = files.filter(f => f !== appFile);
+      
+      const otherFilesContent = otherFiles.map(f => {
+        const content = f.content
+          .replace(/import.*from.*;/g, '')
+          .replace(/export default/g, "const " + f.name.split('.')[0] + " =")
+          .replace(/export/g, '');
+        return "// File: " + f.name + "\n" + content;
+      }).join("\n\n");
+
+      const appFileContent = appFile.content
+        .replace(/import.*from.*;/g, '')
+        .replace(/export default/g, 'const App =')
+        .replace(/export/g, '');
+
+      win.document.write([
+        '<!DOCTYPE html>',
+        '<html>',
+        '<head>',
+        '<meta charset="UTF-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+        '<script src="https://cdn.tailwindcss.com"></script>',
+        '<script src="https://unpkg.com/react@18/umd/react.development.js"></script>',
+        '<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>',
+        '<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>',
+        '<script src="https://unpkg.com/lucide-react@0.344.0/dist/umd/lucide-react.min.js"></script>',
+        '<style>body { margin: 0; font-family: sans-serif; }</style>',
+        '</head>',
+        '<body>',
+        '<div id="root"></div>',
+        '<script type="text/babel">',
+        'const { useState, useEffect, useRef, useMemo } = React;',
+        'const Lucide = window.LucideReact || {};',
+        otherFilesContent,
+        appFileContent,
+        'const root = ReactDOM.createRoot(document.getElementById("root"));',
+        'root.render(<App />);',
+        '</script>',
+        '</body>',
+        '</html>'
+      ].join('\n'));
+    } else {
+      const htmlFile = files.find(f => f.name.endsWith('.html')) || { content: '' };
+      const cssFile = files.find(f => f.name.endsWith('.css')) || { content: '' };
+      const jsFile = files.find(f => f.name.endsWith('.js')) || { content: '' };
+
+      win.document.write([
+        '<!DOCTYPE html>',
+        '<html>',
+        '<head>',
+        '<meta charset="UTF-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+        '<script src="https://cdn.tailwindcss.com"></script>',
+        '<style>' + cssFile.content + '</style>',
+        '</head>',
+        '<body>',
+        htmlFile.content,
+        '<script>' + jsFile.content + '</script>',
+        '</body>',
+        '</html>'
+      ].join('\n'));
+    }
+    win.document.close();
+  };
+
+  const handleCopy = () => {
+    if (files[currentFileIndex]) {
+      navigator.clipboard.writeText(files[currentFileIndex].content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-gray-100 font-sans selection:bg-orange-500/30">
-      {/* Header */}
-      <header className="border-b border-white/10 bg-black/50 backdrop-blur-md sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center">
-              <Layout className="w-5 h-5 text-black" />
-            </div>
-            <h1 className="text-xl font-bold tracking-tight">Vision2Code <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded-full text-gray-400 font-normal ml-2 uppercase tracking-widest">Pro</span></h1>
-          </div>
-          
-          <div className="flex items-center gap-4">
-            <button 
-              onClick={() => setShowSettings(!showSettings)}
-              className="p-2 hover:bg-white/5 rounded-full transition-colors relative"
-            >
-              <Settings className="w-5 h-5 text-gray-400" />
-              {useCustomKey && (
-                <span className="absolute top-1 right-1 w-2 h-2 bg-orange-500 rounded-full border border-black" />
-              )}
-            </button>
-          </div>
-        </div>
-      </header>
+      <Header 
+        onShowProjects={() => setShowProjectList(true)}
+        onShowSettings={() => setShowSettings(true)}
+        useCustomKey={useCustomKey}
+      />
 
       <main className="max-w-7xl mx-auto px-4 py-8">
         <div className="grid lg:grid-cols-[320px_1fr] gap-8">
-          
-          {/* Sidebar: Controls */}
-          <div className="space-y-6">
-            <section className="bg-white/5 border border-white/10 rounded-2xl p-5 space-y-5">
-              <div className="space-y-2">
-                <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Input Image</label>
-                <div 
-                  onClick={() => fileInputRef.current?.click()}
-                  className={cn(
-                    "relative aspect-video rounded-xl border-2 border-dashed border-white/10 hover:border-orange-500/50 transition-all cursor-pointer overflow-hidden group",
-                    image ? "border-solid border-orange-500/30" : ""
-                  )}
-                >
-                  {image ? (
-                    <>
-                      <img src={image} alt="Upload" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                      <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                        <RefreshCw className="w-6 h-6 text-white" />
-                      </div>
-                    </>
-                  ) : (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-500 gap-2">
-                      <ImageIcon className="w-8 h-8" />
-                      <span className="text-xs">Upload design</span>
-                    </div>
-                  )}
-                </div>
-                <input 
-                  type="file" 
-                  ref={fileInputRef} 
-                  onChange={handleImageUpload} 
-                  accept="image/*" 
-                  className="hidden" 
-                />
-              </div>
+          <Sidebar 
+            currentProject={projects.find(p => p.id === currentProjectId) || null}
+            onSaveProject={saveProject}
+            onImageUpload={handleImageUpload}
+            image={image}
+            selectedElement={selectedElement}
+            onClearSelectedElement={() => setSelectedElement(null)}
+            prompt={prompt}
+            onPromptChange={setPrompt}
+            onGenerate={handleGenerate}
+            loading={loading}
+            hasFiles={files.length > 0}
+            onReset={createNewProject}
+          />
 
-              {selectedElement && (
-                <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl p-3 space-y-2 animate-in fade-in slide-in-from-top-2 duration-300">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-orange-500 uppercase tracking-widest flex items-center gap-2">
-                      <MousePointer2 className="w-3 h-3" />
-                      Selected: {selectedElement.tag}
-                    </span>
-                    <button 
-                      onClick={() => setSelectedElement(null)}
-                      className="text-gray-500 hover:text-white transition-colors"
-                    >
-                      <X className="w-3 h-3" />
-                    </button>
-                  </div>
-                  <div className="text-[10px] text-gray-400 font-mono truncate bg-black/40 p-1.5 rounded border border-white/5">
-                    {selectedElement.selector}
-                  </div>
-                </div>
-              )}
+          <div className="space-y-8">
+            <Editor 
+              activeTab={activeTab}
+              onTabChange={setActiveTab}
+              files={files}
+              currentFileIndex={currentFileIndex}
+              onFileSelect={setCurrentFileIndex}
+              onFileChange={handleFileChange}
+              modifiedFileNames={modifiedFileNames}
+              isEditMode={isEditMode}
+              onToggleEditMode={() => {
+                setIsEditMode(!isEditMode);
+                if (isEditMode) setSelectedElement(null);
+              }}
+              previewMode={previewMode}
+              onPreviewModeChange={setPreviewMode}
+              onFullScreen={handleFullScreen}
+              previewRef={previewRef}
+              copied={copied}
+              onCopy={handleCopy}
+            />
 
-              <div className="space-y-2">
-                <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Prompt</label>
-                <textarea 
-                  value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
-                  placeholder="Describe changes or new features..."
-                  className="w-full h-24 bg-black/50 border border-white/10 rounded-xl p-3 text-sm focus:outline-none focus:border-orange-500/50 transition-colors resize-none"
-                />
-              </div>
-
-              <button 
-                onClick={handleGenerate}
-                disabled={loading || (!prompt && !image)}
-                className={cn(
-                  "w-full py-3 rounded-xl font-bold flex items-center justify-center gap-2 transition-all",
-                  loading || (!prompt && !image) 
-                    ? "bg-white/5 text-gray-500 cursor-not-allowed" 
-                    : "bg-orange-500 text-black hover:bg-orange-400 active:scale-[0.98]"
-                )}
+            {explanation && (
+              <motion.section 
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="bg-white/5 border border-white/10 rounded-2xl p-6"
               >
-                {loading ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    {selectedElement ? "Updating Element..." : "Processing..."}
-                  </>
-                ) : (
-                  <>
-                    <Send className="w-4 h-4" />
-                    {selectedElement ? "Update Element" : (files.length > 0 ? "Update Project" : "Generate UI")}
-                  </>
-                )}
-              </button>
-
-              {files.length > 0 && (
-                <button 
-                  onClick={() => {
-                    setFiles([]);
-                    setModifiedFileNames(new Set());
-                    setExplanation("");
-                    setImage(null);
-                    setPrompt("");
-                  }}
-                  className="w-full py-2 rounded-xl text-xs font-medium text-gray-500 hover:text-red-400 border border-white/5 hover:border-red-400/20 transition-all flex items-center justify-center gap-2"
-                >
-                  <Trash2 className="w-3 h-3" />
-                  Reset Project
-                </button>
-              )}
-            </section>
-
-            {/* File Explorer */}
-            {files.length > 0 && (
-              <section className="bg-white/5 border border-white/10 rounded-2xl p-5 space-y-4">
-                <h4 className="text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between">
-                  Project Files
-                  <span className="text-orange-500">{files.length}</span>
-                </h4>
-                <div className="space-y-1 max-h-[300px] overflow-auto custom-scrollbar">
-                  {files.map((file, idx) => (
-                    <button
-                      key={file.name}
-                      onClick={() => {
-                        setCurrentFileIndex(idx);
-                        setActiveTab("code");
-                      }}
-                      className={cn(
-                        "w-full flex items-center gap-3 px-3 py-2 rounded-lg text-xs transition-all",
-                        currentFileIndex === idx 
-                          ? "bg-orange-500/10 text-orange-500 border border-orange-500/20" 
-                          : "text-gray-400 hover:bg-white/5 hover:text-white"
-                      )}
-                    >
-                      <FileCode className="w-4 h-4" />
-                      <span className="truncate">{file.name}</span>
-                      {modifiedFileNames.has(file.name) && (
-                        <span className="ml-auto text-[8px] bg-blue-500/20 text-blue-400 px-1 py-0.5 rounded border border-blue-500/30 uppercase font-bold tracking-tighter">
-                          Mod
-                        </span>
-                      )}
-                      {currentFileIndex === idx && !modifiedFileNames.has(file.name) && <ChevronRight className="w-3 h-3 ml-auto" />}
-                    </button>
-                  ))}
+                <h2 className="text-lg font-bold mb-4 flex items-center gap-2">
+                  <div className="w-1.5 h-6 bg-orange-500 rounded-full" />
+                  AI Explanation
+                </h2>
+                <div className="prose prose-invert prose-sm max-w-none prose-orange">
+                  <ReactMarkdown>{explanation}</ReactMarkdown>
                 </div>
-              </section>
+              </motion.section>
             )}
-
-            {/* Settings */}
-            <AnimatePresence>
-              {showSettings && (
-                <motion.div 
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 10 }}
-                  className="bg-white/5 border border-white/10 rounded-2xl p-5 space-y-4"
-                >
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-xs font-bold flex items-center gap-2">
-                      <Key className="w-3 h-3 text-orange-500" />
-                      Configuration
-                    </h3>
-                    <button onClick={() => setShowSettings(false)} className="text-[10px] text-gray-500 hover:text-white">Close</button>
-                  </div>
-                  
-                  <div className="space-y-3">
-                    <div className="space-y-1">
-                      <label className="text-[10px] text-gray-500 uppercase">Model</label>
-                      <select 
-                        value={selectedModel}
-                        onChange={(e) => setSelectedModel(e.target.value)}
-                        className="w-full bg-black/50 border border-white/10 rounded-lg p-2 text-xs focus:outline-none focus:border-orange-500/50 appearance-none"
-                      >
-                        <option value="gemini-flash-latest">Gemini Flash</option>
-                        <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
-                      </select>
-                    </div>
-
-                    <div className="flex items-center gap-2 p-2 rounded-lg bg-black/30 border border-white/5">
-                      <input 
-                        type="checkbox" 
-                        id="useCustom" 
-                        checked={useCustomKey}
-                        onChange={(e) => setUseCustomKey(e.target.checked)}
-                        className="w-3 h-3 rounded border-white/10 bg-black text-orange-500 focus:ring-orange-500"
-                      />
-                      <label htmlFor="useCustom" className="text-[10px] text-gray-300 cursor-pointer">Custom API Key</label>
-                    </div>
-
-                    {useCustomKey && (
-                      <input 
-                        type="password" 
-                        value={customApiKey}
-                        onChange={(e) => setCustomApiKey(e.target.value)}
-                        placeholder="Enter Key"
-                        className="w-full bg-black/50 border border-white/10 rounded-lg p-2 text-xs focus:outline-none focus:border-orange-500/50"
-                      />
-                    )}
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </div>
-
-          {/* Main Content: Output */}
-          <div className="flex flex-col h-[calc(100vh-160px)] min-h-[600px]">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex bg-white/5 p-1 rounded-xl border border-white/10">
-                <button 
-                  onClick={() => setActiveTab("code")}
-                  className={cn(
-                    "px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all",
-                    activeTab === "code" ? "bg-white/10 text-white shadow-lg" : "text-gray-500 hover:text-gray-300"
-                  )}
-                >
-                  <Code className="w-4 h-4" />
-                  Code
-                </button>
-                <button 
-                  onClick={() => setActiveTab("preview")}
-                  className={cn(
-                    "px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all",
-                    activeTab === "preview" ? "bg-white/10 text-white shadow-lg" : "text-gray-500 hover:text-gray-300"
-                  )}
-                >
-                  <Eye className="w-4 h-4" />
-                  Preview
-                </button>
-              </div>
-
-              {activeTab === "preview" && files.length > 0 && (
-                <div className="flex items-center gap-4">
-                  {isEditMode && (
-                    <span className="text-[10px] text-orange-400 font-medium animate-pulse">
-                      Click an element in the preview to select it
-                    </span>
-                  )}
-                  <button 
-                    onClick={() => {
-                      setIsEditMode(!isEditMode);
-                      if (isEditMode) setSelectedElement(null);
-                    }}
-                    className={cn(
-                      "px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-2 border transition-all",
-                      isEditMode 
-                        ? "bg-orange-500 border-orange-400 text-black shadow-[0_0_15px_rgba(249,115,22,0.3)]" 
-                        : "bg-white/5 border-white/10 text-gray-400 hover:text-white"
-                    )}
-                  >
-                    <MousePointer2 className="w-3 h-3" />
-                    {isEditMode ? "Exit Visual Edit" : "Visual Edit"}
-                  </button>
-                </div>
-              )}
-
-              {files.length > 0 && activeTab === "code" && (
-                <div className="flex items-center gap-3">
-                  <div className="text-[10px] text-gray-500 bg-white/5 px-3 py-1.5 rounded-full border border-white/5">
-                    {files[currentFileIndex]?.name}
-                  </div>
-                  <button 
-                    onClick={copyToClipboard}
-                    className="p-2 hover:bg-white/5 rounded-lg text-gray-400 hover:text-white transition-all flex items-center gap-2 text-xs"
-                  >
-                    {copied ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
-                    {copied ? "Copied!" : "Copy"}
-                  </button>
-                </div>
-              )}
-            </div>
-
-            <div className="flex-1 bg-white/5 border border-white/10 rounded-2xl overflow-hidden relative">
-              {loading && (
-                <div className="absolute inset-0 z-10 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center gap-4">
-                  <div className="relative">
-                    <Loader2 className="w-12 h-12 text-orange-500 animate-spin" />
-                    <div className="absolute inset-0 blur-xl bg-orange-500/20 animate-pulse" />
-                  </div>
-                  <div className="text-center space-y-1">
-                    <p className="text-lg font-bold text-white">
-                      {selectedElement ? "Updating Element" : "Generating Project"}
-                    </p>
-                    <p className="text-sm text-gray-400">
-                      {selectedElement ? "Applying changes to selected element..." : "Analyzing segments and writing files..."}
-                    </p>
-                  </div>
-                </div>
-              )}
-
-              {activeTab === "code" ? (
-                <div className="h-full overflow-auto p-0 custom-scrollbar">
-                  {files.length > 0 ? (
-                    <div className="h-full flex flex-col">
-                      {explanation && (
-                        <div className="p-4 bg-orange-500/5 border-b border-white/5 text-xs text-orange-200/70 italic">
-                          {explanation}
-                        </div>
-                      )}
-                      <div className="flex-1 p-6">
-                        <pre className="!bg-transparent !p-0 !m-0">
-                          <code className={`language-${files[currentFileIndex]?.language}`}>
-                            {files[currentFileIndex]?.content}
-                          </code>
-                        </pre>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="h-full flex flex-col items-center justify-center text-gray-600 gap-4">
-                      <FileJson className="w-12 h-12 opacity-20" />
-                      <p className="text-sm">Generate a design to see the code</p>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="h-full bg-white">
-                  <iframe 
-                    ref={previewRef}
-                    title="Preview"
-                    className="w-full h-full border-none"
-                  />
-                </div>
-              )}
-            </div>
           </div>
         </div>
       </main>
+
+      <ProjectListModal 
+        isOpen={showProjectList}
+        onClose={() => setShowProjectList(false)}
+        projects={projects}
+        currentProjectId={currentProjectId}
+        onLoadProject={loadProject}
+        onDeleteProject={deleteProject}
+        onCreateNewProject={createNewProject}
+      />
+
+      <SettingsModal 
+        isOpen={showSettings}
+        onClose={() => setShowSettings(false)}
+        customApiKey={customApiKey}
+        onCustomApiKeyChange={setCustomApiKey}
+        useCustomKey={useCustomKey}
+        onUseCustomKeyChange={setUseCustomKey}
+        selectedModel={selectedModel}
+        onSelectedModelChange={setSelectedModel}
+      />
+
+      <LoadingOverlay 
+        isLoading={loading}
+        isUpdatingElement={!!selectedElement}
+      />
 
       <style>{`
         .custom-scrollbar::-webkit-scrollbar {

@@ -97,14 +97,43 @@ Guidelines:
     }
 
     try {
-      const result = JSON.parse(response.text);
+      // Robust JSON extraction
+      let jsonText = response.text.trim();
+      
+      // Remove potential markdown code block wrappers
+      jsonText = jsonText.replace(/^```json\s*/i, "").replace(/\s*```$/i, "").trim();
+      
+      // If it still doesn't look like JSON, try to find the first '{' and last '}'
+      if (!jsonText.startsWith("{")) {
+        const start = jsonText.indexOf("{");
+        const end = jsonText.lastIndexOf("}");
+        if (start !== -1 && end !== -1 && end > start) {
+          jsonText = jsonText.substring(start, end + 1);
+        }
+      }
+
+      const result = JSON.parse(jsonText);
       return {
         files: result.files || [],
         explanation: result.explanation || "Generated successfully."
       };
     } catch (e) {
       console.error("JSON Parse Error:", response.text);
-      // Fallback if JSON parsing fails (though responseMimeType should prevent this)
+      
+      // Last ditch effort: try to find any JSON-like structure
+      const jsonMatch = response.text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          const result = JSON.parse(jsonMatch[0]);
+          return {
+            files: result.files || [],
+            explanation: result.explanation || "Generated successfully."
+          };
+        } catch (innerE) {
+          console.error("Inner JSON Parse Error:", innerE);
+        }
+      }
+      
       return {
         files: [{ name: "index.html", content: response.text, language: "html" }],
         explanation: "Error parsing structured response. Showing raw output."
