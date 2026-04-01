@@ -1,0 +1,5 @@
+{
+  "name": "Vision2Code",
+  "description": "Generate production-ready website UI code from images and prompts using Gemini AI.",
+  "requestFramePermissions": []
+}
